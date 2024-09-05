@@ -10,7 +10,7 @@ import re
 import os
 import logging
 from file_handlers import read_pdf, read_docx
-from text_processing import norwegian_tokenize, is_complete_sentence, detect_language
+from text_processing import detect_language
 from hr_openai_utils import (
     extract_hr_keywords,
     categorize_hr_document,
@@ -20,7 +20,6 @@ from hr_openai_utils import (
 )
 from config import MAX_FILE_SIZE, OPENAI_MODEL, LOG_LEVEL, LOG_FILE
 from custom_exceptions import FileProcessingError, APIError
-from async_processors import process_file_async
 
 # Setup logging
 logging.basicConfig(filename=LOG_FILE, level=getattr(logging, LOG_LEVEL),
@@ -42,16 +41,9 @@ def create_zip_file(all_results):
     with zipfile.ZipFile(zip_buffer, 'a', zipfile.ZIP_DEFLATED, False) as zip_file:
         for original_filename, document_json in all_results.items():
             try:
-                # Parse the JSON string to ensure it's valid
                 document_data = json.loads(document_json)
-
-                # Create a filename for this document
                 document_filename = f"{original_filename}.json"
-
-                # Convert the document data back to a JSON string
                 document_content = json.dumps(document_data, ensure_ascii=False, indent=2)
-
-                # Add the file to the ZIP archive
                 zip_file.writestr(document_filename, document_content)
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON for document {original_filename}")
@@ -79,32 +71,31 @@ def format_time(seconds):
 
 
 def extract_url(text):
-    lines = text.split('\n')
-    for i, line in enumerate(lines[:5]):
-        url_match = re.search(r'(https?://\S+)', line)
-        if url_match:
-            url = url_match.group(1)
-            lines[i] = line.replace(url, '').strip()
-            new_text = '\n'.join(line for line in lines if line.strip())
-            return url, new_text
-    return None, text
+    logger.info(f"Extracting URL from text: {text[:100].encode('unicode_escape').decode('utf-8')}")
+    text = text.lstrip('\ufeff')
+    url_pattern = r'^(https?://[^\s]+)[\s\S]*'
+    match = re.match(url_pattern, text)
+    if match:
+        url = match.group(1)
+        remaining_text = text[len(url):].strip()
+        logger.info(f"Extracted URL: {url}")
+        logger.info(f"Remaining text: {remaining_text[:100].encode('unicode_escape').decode('utf-8')}")
+        return url, remaining_text
+    logger.info("No URL found in text")
+    return None, text.strip()
 
 
 def clean_filename(filename):
-    # Remove file extension
     name = os.path.splitext(filename)[0]
-    # Remove 'docx' if it's still present (for cases like 'file.name.docx')
     name = name.replace('docx', '').strip()
-    # Replace underscores and hyphens with spaces
     name = re.sub(r'[_-]', ' ', name)
-    # Capitalize the first letter of each word
     return ' '.join(word.capitalize() for word in name.split())
 
 
 def process_file(file, client):
     try:
         if file.type == "text/plain":
-            text = file.read().decode("utf-8")
+            text = file.read().decode("utf-8-sig")
         elif file.type == "application/pdf":
             text = read_pdf(file)
         elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -112,15 +103,16 @@ def process_file(file, client):
         else:
             raise ValueError("Filtypen støttes ikke.")
 
-        logger.info(f"Filinnhold for {file.name}: {text[:100]}...")  # Log the first 100 characters
+        logger.info(f"File content for {file.name}: {text[:100].encode('unicode_escape').decode('utf-8')}")
         if not text.strip():
-            logger.warning(f"Filen {file.name} er tom eller inneholder bare whitespace.")
+            logger.warning(f"File {file.name} is empty or contains only whitespace.")
             return None
 
+        logger.info(f"Calling structure_document for {file.name}")
         return structure_document(text, client, file.name)
     except Exception as e:
         logger.error(f"Error processing file {file.name}: {str(e)}", exc_info=True)
-        return None  # Return None instead of raising an exception
+        return None
 
 
 def structure_document(text, client, filename):
@@ -129,8 +121,10 @@ def structure_document(text, client, filename):
     if lang != 'no':
         logger.warning(f"Document {filename} appears to be in {lang}, not Norwegian. Results may be inaccurate.")
 
+    logger.info(f"Original text (first 100 characters): {text[:100].encode('unicode_escape').decode('utf-8')}")
     url, text = extract_url(text)
-    logger.info(f"Processing entire document: {filename}")
+    logger.info(f"Extracted URL for {filename}: {url}")
+    logger.info(f"Processed text (first 100 characters): {text[:100].encode('unicode_escape').decode('utf-8')}")
 
     try:
         title = clean_filename(filename)
@@ -144,24 +138,22 @@ def structure_document(text, client, filename):
         document_data = {
             "title": title,
             "body": text.strip(),
-            "category": category,
-            "entities": entities,
             "summary": summary,
             "tags": keywords,
-            "url": url if url else None
+            "url": url,
+            "category": category,
+            "entities": entities if isinstance(entities, dict) else {"raw": entities},
+            "positive": sentiment_keywords.get('positive', []) if isinstance(sentiment_keywords, dict) else [],
+            "negative": sentiment_keywords.get('negative', []) if isinstance(sentiment_keywords, dict) else []
         }
 
-        if isinstance(sentiment_keywords, dict) and 'positive' in sentiment_keywords and 'negative' in sentiment_keywords:
-            document_data["tags"].extend(sentiment_keywords['positive'] + sentiment_keywords['negative'])
-            logger.info(f"Added sentiment keywords to tags for {filename}")
-        else:
-            logger.warning(f"Unexpected format for sentiment keywords in {filename}: {sentiment_keywords}")
-
         logger.info(f"Document processed successfully: {filename}")
+        logger.info(f"Final document data for {filename}: {json.dumps(document_data, ensure_ascii=False, indent=2)}")
         return json.dumps(document_data, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error processing document {filename}: {str(e)}", exc_info=True)
         return None
+
 
 async def process_files(uploaded_files, api_key, progress_bar, status_text, file_overview, document_overview,
                         time_estimate):
@@ -206,7 +198,6 @@ async def process_files(uploaded_files, api_key, progress_bar, status_text, file
                 logger.warning(f"No content was generated for {uploaded_file.name}")
                 document_titles.append(f"{clean_filename(uploaded_file.name)} - [Processing Failed]")
 
-            # Update file overview
             file_status = {name: "Processed" if doc else "Failed" for name, doc in all_results.items()}
             file_overview.json(file_status)
 
@@ -216,10 +207,9 @@ async def process_files(uploaded_files, api_key, progress_bar, status_text, file
 
             progress_bar.progress((i + 1) / total_files)
 
-            # Calculate and update time estimate
             elapsed_time = time.time() - start_time
             files_processed = i + 1
-            if files_processed > 1:  # Avoid division by zero
+            if files_processed > 1:
                 avg_time_per_file = elapsed_time / files_processed
                 remaining_files = total_files - files_processed
                 estimated_remaining_time = avg_time_per_file * remaining_files
@@ -279,7 +269,6 @@ async def main_async():
                         if all_results:
                             st.success(f"Behandlet {len(all_results)} dokument(er) vellykket.")
 
-                            # Check if there are any documents in the results
                             total_documents = len(all_results)
                             logger.info(f"Total documents generated: {total_documents}")
 

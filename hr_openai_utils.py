@@ -7,9 +7,18 @@ logger = logging.getLogger(__name__)
 
 def safe_json_loads(content):
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return content
+        if isinstance(content, str):
+            # Remove any leading/trailing whitespace and "```json" markers
+            content = content.strip().replace('```json', '').replace('```', '').strip()
+            return json.loads(content)
+        elif isinstance(content, dict):
+            return content
+        else:
+            raise ValueError(f"Unexpected type: {type(content)}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON: {content}")
+        logger.error(f"JSON decode error: {str(e)}")
+        return {}
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def call_openai_api(client, messages, max_tokens):
@@ -45,7 +54,7 @@ def extract_hr_entities(text, client):
     ]
     return safe_json_loads(call_openai_api(client, messages, 500))
 
-def summarize_hr_text(text, client, max_words=50):
+def summarize_hr_text(text, client, max_words=200):
     messages = [
         {"role": "system", "content": "Du er en HR-spesialist som lager konsise sammendrag av HR-relatert tekst på norsk."},
         {"role": "user", "content": f"Lag et HR-fokusert sammendrag på rundt {max_words} ord av følgende tekst på norsk:\n\n{text[:2000]}"}

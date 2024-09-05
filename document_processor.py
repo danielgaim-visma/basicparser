@@ -1,8 +1,9 @@
 import json
 import re
 import os
+import logging
 from file_handlers import read_pdf, read_docx
-from text_processing import norwegian_tokenize, is_complete_sentence, detect_language
+from text_processing import detect_language
 from hr_openai_utils import (
     extract_hr_keywords,
     categorize_hr_document,
@@ -11,73 +12,85 @@ from hr_openai_utils import (
     extract_sentiment_keywords
 )
 
+logger = logging.getLogger(__name__)
+
 
 def extract_url(text):
-    url_match = re.match(r'^(https?://\S+)\s*([\s\S]*)', text.strip())
-    if url_match:
-        return url_match.group(1), url_match.group(2).strip()
-    return None, text
+    logger.info(f"Extracting URL from text: {text[:100].encode('unicode_escape').decode('utf-8')}")
+    text = text.lstrip('\ufeff')
+    url_pattern = r'(https?://[^\s]+)'
+    match = re.search(url_pattern, text)
+    if match:
+        url = match.group(1)
+        remaining_text = text[:match.start()] + text[match.end():]
+        logger.info(f"Extracted URL: {url}")
+        logger.info(f"Remaining text: {remaining_text[:100].encode('unicode_escape').decode('utf-8')}")
+        return url, remaining_text.strip()
+    logger.info("No URL found in text")
+    return None, text.strip()
 
 
 def clean_filename(filename):
-    # Remove file extension
     name = os.path.splitext(filename)[0]
-    # Remove 'docx' if it's still present (for cases like 'file.name.docx')
     name = name.replace('docx', '').strip()
-    # Replace underscores and hyphens with spaces
     name = re.sub(r'[_-]', ' ', name)
-    # Capitalize the first letter of each word
     return ' '.join(word.capitalize() for word in name.split())
 
 
 def process_file(file, client):
-    if file.type == "text/plain":
-        text = file.read().decode("utf-8")
-    elif file.type == "application/pdf":
-        text = read_pdf(file)
-    elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        text = read_docx(file)
-    else:
-        raise ValueError("Filtypen støttes ikke.")
+    try:
+        if file.type == "text/plain":
+            text = file.read().decode("utf-8")
+        elif file.type == "application/pdf":
+            text = read_pdf(file)
+        elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            text = read_docx(file)
+        else:
+            raise ValueError("Filtypen støttes ikke.")
 
-    return structure_document(text, client, file.name)
+        logger.info(f"File content for {file.name} (first 100 characters): {text[:100].encode('unicode_escape').decode('utf-8')}")
+        if not text.strip():
+            logger.warning(f"File {file.name} is empty or contains only whitespace.")
+            return None
+
+        return structure_document(text, client, file.name)
+    except Exception as e:
+        logger.error(f"Error processing file {file.name}: {str(e)}", exc_info=True)
+        return None
 
 
 def structure_document(text, client, filename):
     lang = detect_language(text)
+    logger.info(f"Detected language for {filename}: {lang}")
     if lang != 'no':
-        print(f"Advarsel: Dokumentet ser ut til å være på {lang}, ikke norsk. Resultater kan være unøyaktige.")
+        logger.warning(f"Document {filename} appears to be in {lang}, not Norwegian. Results may be inaccurate.")
 
+    logger.info(f"Original text (first 100 characters): {text[:100].encode('unicode_escape').decode('utf-8')}")
     url, text = extract_url(text)
+    logger.info(f"Extracted URL for {filename}: {url}")
+    logger.info(f"Processed text (first 100 characters): {text[:100].encode('unicode_escape').decode('utf-8')}")
 
     try:
         title = clean_filename(filename)
         keywords = extract_hr_keywords(text, client)
         category = categorize_hr_document(text, client)
         entities = extract_hr_entities(text, client)
-        tags2 = extract_sentiment_keywords(text, client)
-        summary = summarize_hr_text(text, client)
+        sentiment_keywords = extract_sentiment_keywords(text, client)
+        logger.info(f"Sentiment keywords for {filename}: {sentiment_keywords}")
+        summary = summarize_hr_text(text, client, max_words=200)
 
         document_data = {
             "title": title,
             "body": text.strip(),
-            "category": category,
-            "entities": entities,
             "summary": summary,
+            "tags": keywords,
+            "url": url,
+            "category": category,
+            "entities": entities if isinstance(entities, dict) else {"raw": entities},
+            "positive": sentiment_keywords.get('positive', []) if isinstance(sentiment_keywords, dict) else [],
+            "negative": sentiment_keywords.get('negative', []) if isinstance(sentiment_keywords, dict) else []
         }
 
-        if url:
-            document_data["body"] += f"\n\nURL: \"{url}\""
-
-        document_data["body"] += f"\n\nTags: {', '.join(keywords)}"
-
-        if isinstance(tags2, dict) and 'positive' in tags2 and 'negative' in tags2:
-            all_tags2 = tags2['positive'] + tags2['negative']
-            document_data["body"] += f"\nTags2: {', '.join(all_tags2)}"
-        else:
-            document_data["body"] += "\nTags2: [Kunne ikke generere Tags2]"
-
+        logger.info(f"Final document data for {filename}: {json.dumps(document_data, ensure_ascii=False, indent=2)}")
         return json.dumps(document_data, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error processing document {filename}: {str(e)}")
-        return None
+

@@ -101,5 +101,10 @@ validators==0.33.0
 wordcloud==1.9.3
 yarl==1.9.7
 zipp==3.20.1
+Pillow==9.5.0
+
+
+
+
 
 
